@@ -1,0 +1,8 @@
+# パスワードと作成したリソースの ID が入る。コミットしない
+.state.json
+results/
+agent/.build/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
