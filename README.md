@@ -9,8 +9,6 @@ LLM にツールとして Retrieve を渡すと、LLM が filter や userContext
 | REQUEST interceptor（Lambda） | LLM が書いた userContext と filter を、Cognito のトークンのクレームで入れ直す | `lambdas/interceptor.py`、`scripts/03_gateway.py` |
 | AgentCore Policy（Cedar） | userContext.userId がトークンの email と一致しない呼び出しを拒否する | `scripts/04_policy.py` |
 
-> 現在の構成（トークン交換、2 つの Gateway への Policy、メタデータを守るバケットポリシー）は、まだ通しで実行していません。実行して結果を確かめたら、この注記を外します。
-
 ## 構成
 
 ![構成図](docs/architecture.png)
