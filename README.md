@@ -11,16 +11,7 @@ LLM にツールとして Retrieve を渡すと、LLM が filter や userContext
 
 ## 構成
 
-```mermaid
-flowchart LR
-  U[ユーザー<br/>Cognito でサインイン] -->|アクセストークン| R[AgentCore Runtime<br/>Strands Agent]
-  R -->|同じトークン| G1[Gateway kbmf-gw<br/>REQUEST interceptor]
-  R -.->|同じトークン| G2[Gateway kbmf-gw-policy<br/>Policy engine ENFORCE]
-  G1 --> I[Lambda<br/>kbmf-interceptor]
-  G1 -->|Retrieve| KB[Managed Knowledge Base<br/>kbmf-kb]
-  G2 -->|Retrieve| KB
-  KB --- S3[S3<br/>文書・メタデータ・ACL]
-```
+![構成図](docs/architecture.png)
 
 - ユーザーのアクセストークンは、Runtime からエージェント、エージェントから Gateway へそのまま渡します（トークン交換はしません）。Runtime と Gateway はどちらも `customJWTAuthorizer.allowedClients` で Cognito の同じクライアントを受け付けます
 - Cognito の Pre Token Generation（V3）で、アクセストークンに `email` と `department` を入れます（`lambdas/pretoken.py`）
