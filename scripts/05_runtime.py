@@ -1,9 +1,10 @@
 """AgentCore Runtime（kbmf_agent）に agent/main.py を CodeZip で置く。
 
 - S3: kbmf-code-<アカウント ID>（arm64 の依存を入れた zip）
-- IAM: kbmf-runtime-role（ログ、ワークロードトークン、jp. の推論プロファイルで Sonnet 4.6）
-- inbound: CUSTOM_JWT（Cognito、allowedClients=[web]）
-- requestHeaderAllowlist: Authorization（エージェントがユーザーのトークンを Gateway に渡すため）
+- AgentCore Identity: OAuth2 credential provider kbmf-obo（Cognito の agent クライアント、On-Behalf-Of の設定つき）
+  エージェントはこれを使って、ユーザーのトークンを Gateway 用のトークン（aud = kbmf-gateway）に交換する
+- IAM: kbmf-runtime-role（ログ、ワークロードトークン、トークン交換、jp. の推論プロファイルで Sonnet 4.6）
+- inbound: CUSTOM_JWT（Cognito、allowedClients=[web]）。サインインしたユーザーのトークンで呼ぶ
 """
 
 import shutil
@@ -14,7 +15,8 @@ from pathlib import Path
 
 import boto3
 
-from common import ACCOUNT, PREFIX, REGION, ROOT, ctl, ensure_role, load_state, save_state
+from common import (ACCOUNT, GATEWAY_AUDIENCE, GATEWAY_SCOPE, PREFIX, REGION, ROOT, ctl, ensure_role, load_state,
+                    save_state)
 
 s3 = boto3.client("s3", region_name=REGION)
 
@@ -24,6 +26,26 @@ BUCKET = f"{PREFIX}-code-{ACCOUNT}"
 NAME = f"{PREFIX}_agent"  # Runtime の名前にハイフンは使えない
 KEY = f"{NAME}/code.zip"
 MODEL = "anthropic.claude-sonnet-4-6"
+PROVIDER = f"{PREFIX}-obo"
+
+
+def ensure_provider(state: dict) -> None:
+    try:
+        ctl.get_oauth2_credential_provider(name=PROVIDER)
+        return
+    except ctl.exceptions.ResourceNotFoundException:
+        pass
+    agent = state["cognito"]["agent"]
+    ctl.create_oauth2_credential_provider(
+        name=PROVIDER, credentialProviderVendor="CustomOauth2",
+        oauth2ProviderConfigInput={"customOauth2ProviderConfig": {
+            "oauthDiscovery": {"discoveryUrl": f"{state['cognito']['issuer']}/.well-known/openid-configuration"},
+            "clientId": agent["id"], "clientSecret": agent["secret"],
+            "clientAuthenticationMethod": "CLIENT_SECRET_BASIC",
+            # actor_token に、agent クライアントの client_credentials で取ったトークンを付ける
+            "onBehalfOfTokenExchangeConfig": {"grantType": "TOKEN_EXCHANGE", "tokenExchangeGrantTypeConfig": {
+                "actorTokenContent": "M2M", "actorTokenScopes": [GATEWAY_SCOPE]}}}})
+    print(f"created credential provider {PROVIDER}")
 
 
 def build_zip() -> Path:
@@ -54,15 +76,20 @@ def upload(zip_path: Path) -> None:
 
 def runtime_role() -> str:
     wid = f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:workload-identity-directory/default"
+    vault = f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:token-vault/default"
     return ensure_role(f"{PREFIX}-runtime-role", "bedrock-agentcore.amazonaws.com", {
         "Version": "2012-10-17", "Statement": [
             {"Effect": "Allow", "Resource": "*", "Action": [
                 "logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams",
                 "logs:DescribeLogGroups", "xray:PutTraceSegments", "xray:PutTelemetryRecords",
                 "cloudwatch:PutMetricData"]},
-            {"Effect": "Allow", "Resource": [wid, f"{wid}/workload-identity/*"], "Action": [
+            {"Effect": "Allow", "Resource": [wid, f"{wid}/workload-identity/*", vault,
+                                             f"{vault}/oauth2credentialprovider/*"], "Action": [
                 "bedrock-agentcore:GetWorkloadAccessToken", "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
-                "bedrock-agentcore:GetWorkloadAccessTokenForUserId"]},
+                "bedrock-agentcore:GetWorkloadAccessTokenForUserId", "bedrock-agentcore:GetResourceOauth2Token"]},
+            # credential provider の client secret は Identity が Secrets Manager に置く
+            {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue",
+             "Resource": f"arn:aws:secretsmanager:{REGION}:{ACCOUNT}:secret:bedrock-agentcore-identity!*"},
             # jp. の推論プロファイルは東京と大阪に振り分けるので、両方の基盤モデルを許可する
             {"Effect": "Allow", "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
              "Resource": [f"arn:aws:bedrock:{REGION}:{ACCOUNT}:inference-profile/jp.{MODEL}",
@@ -79,8 +106,7 @@ def ensure_runtime(state: dict, role_arn: str) -> dict:
         authorizerConfiguration={"customJWTAuthorizer": {
             "discoveryUrl": f"{state['cognito']['issuer']}/.well-known/openid-configuration",
             "allowedClients": [state["cognito"]["client_id"]]}},
-        requestHeaderConfiguration={"requestHeaderAllowlist": ["Authorization"]},
-        environmentVariables={"AWS_REGION": REGION})
+        environmentVariables={"AWS_REGION": REGION, "OBO_PROVIDER": PROVIDER, "GATEWAY_AUDIENCE": GATEWAY_AUDIENCE})
     rt = next((r for r in ctl.list_agent_runtimes().get("agentRuntimes", []) if r["agentRuntimeName"] == NAME), None)
     if rt:
         rid = rt["agentRuntimeId"]
@@ -106,6 +132,7 @@ def ensure_runtime(state: dict, role_arn: str) -> dict:
 
 def main() -> None:
     state = load_state()
+    ensure_provider(state)
     upload(build_zip())
     state["runtime"] = {**ensure_runtime(state, runtime_role()), "bucket": BUCKET}
     save_state(state)

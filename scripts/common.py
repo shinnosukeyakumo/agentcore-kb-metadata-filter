@@ -10,6 +10,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -26,6 +27,12 @@ RESULTS = ROOT / "results"
 USER_A = "user-a@example.com"  # 人事部（hr）
 USER_B = "user-b@example.com"  # 営業部（sales）
 DEPARTMENTS = {USER_A: "hr", USER_B: "sales"}
+
+# Gateway 向けのトークンの aud。Cognito の resource server の識別子でもある
+GATEWAY_AUDIENCE = f"{PREFIX}-gateway"
+GATEWAY_SCOPE = f"{GATEWAY_AUDIENCE}/kb.read"
+TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
+ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 
 sts = boto3.client("sts", region_name=REGION)
 iam = boto3.client("iam", region_name=REGION)
@@ -66,6 +73,35 @@ def sign_in(state: dict, email: str) -> str:
         AuthParameters={"USERNAME": email, "PASSWORD": state["cognito"]["passwords"][email]},
     )
     return r["AuthenticationResult"]["AccessToken"]
+
+
+def token_endpoint(state: dict, form: dict) -> dict:
+    """Cognito の token endpoint に agent クライアント（client_secret_basic）で POST する。"""
+    agent = state["cognito"]["agent"]
+    basic = base64.b64encode(f"{agent['id']}:{agent['secret']}".encode()).decode()
+    req = urllib.request.Request(state["cognito"]["token_endpoint"], method="POST",
+                                 data=urllib.parse.urlencode(form).encode(), headers={
+                                     "Content-Type": "application/x-www-form-urlencoded",
+                                     "Authorization": f"Basic {basic}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"token endpoint {e.code}: {e.read().decode()[:300]}") from None
+
+
+def gateway_token(state: dict, email: str) -> str:
+    """ユーザーのトークンを、Gateway 向け（aud = kbmf-gateway）に交換して返す。
+
+    Runtime の中では AgentCore Identity が同じ交換をする（agent/main.py）。
+    テストは Runtime を通さずに Gateway を呼ぶので、Cognito の token exchange を直接呼ぶ。
+    actor token は agent クライアントの client_credentials で取る（委任になり、act クレームが付く）。
+    """
+    actor = token_endpoint(state, {"grant_type": "client_credentials", "scope": GATEWAY_SCOPE})["access_token"]
+    return token_endpoint(state, {
+        "grant_type": TOKEN_EXCHANGE, "subject_token": sign_in(state, email),
+        "subject_token_type": ACCESS_TOKEN_TYPE, "audience": GATEWAY_AUDIENCE,
+        "actor_token": actor, "actor_token_type": ACCESS_TOKEN_TYPE})["access_token"]
 
 
 def mcp(url: str, token: str, method: str, params: dict | None = None) -> tuple[int, dict]:

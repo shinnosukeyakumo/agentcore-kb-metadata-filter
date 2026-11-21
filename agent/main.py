@@ -1,16 +1,24 @@
 """AgentCore Runtime 上のエージェント。
 
-Runtime が受け取ったユーザーのアクセストークン（Authorization ヘッダー）を、そのまま Gateway に渡す。
-LLM（Claude Sonnet 4.6）には Gateway の Retrieve ツールを 1 本だけ渡し、filter の書き方は指示しない。
-LLM がツール引数に何を書いたかと、検索で返ってきた文書名を返す。トークン本体は返さない。
+1. Runtime が、入口で検証したユーザーのトークンからワークロードトークンを作って渡してくる
+2. AgentCore Identity の On-Behalf-Of で、Gateway 用のトークン（aud = kbmf-gateway）に交換する
+   中では Cognito の token exchange が呼ばれる。ユーザーの email と department は交換後のトークンにも入る
+3. 交換したトークンで Gateway に接続し、LLM（Claude Sonnet 4.6）に Retrieve ツールを 1 本だけ渡す
+   filter の書き方は指示しない
+
+LLM がツール引数に何を書いたか、検索で返ってきた文書名、交換後のトークンのクレームを返す。トークン本体は返さない。
 
 payload: {"gateway_url": "...", "target": "open" | "locked", "prompt": "..."}
 """
 
+import base64
+import json
 import os
 import re
 
+import boto3
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from bedrock_agentcore.runtime.context import BedrockAgentCoreContext
 from strands import Agent
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
@@ -19,8 +27,27 @@ REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
 MODEL_ID = "jp.anthropic.claude-sonnet-4-6"
 SYSTEM_PROMPT = "You are an internal assistant. Use the Retrieve tool to search company documents, then answer the user."
 DOC = re.compile(r"docs/([a-z]+/[a-z0-9-]+)\.txt")
+PROVIDER = os.environ["OBO_PROVIDER"]
+AUDIENCE = os.environ["GATEWAY_AUDIENCE"]
+ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 
 app = BedrockAgentCoreApp()
+dp = boto3.client("bedrock-agentcore", region_name=REGION)
+
+
+def claims(token: str) -> dict:
+    p = token.split(".")[1]
+    p += "=" * (-len(p) % 4)
+    c = json.loads(base64.urlsafe_b64decode(p))
+    return {k: c.get(k) for k in ("client_id", "aud", "email", "department", "act")}
+
+
+def exchange(wat: str) -> str:
+    # Identity は subject_token_type に jwt を付けて送るが、Cognito は access_token しか受け付けないので上書きする
+    return dp.get_resource_oauth2_token(
+        workloadIdentityToken=wat, resourceCredentialProviderName=PROVIDER,
+        oauth2Flow="ON_BEHALF_OF_TOKEN_EXCHANGE", scopes=[], audiences=[AUDIENCE],
+        customParameters={"subject_token_type": ACCESS_TOKEN_TYPE})["accessToken"]
 
 
 def run_llm(url: str, token: str, prompt: str, target: str) -> dict:
@@ -44,11 +71,11 @@ def run_llm(url: str, token: str, prompt: str, target: str) -> dict:
 
 @app.entrypoint
 def invoke(payload, context):
-    headers = {k.lower(): v for k, v in (getattr(context, "request_headers", None) or {}).items()}
-    auth = headers.get("authorization", "")
-    if not auth.startswith("Bearer "):
-        return {"error": "no Authorization header. Set requestHeaderAllowlist on the runtime."}
-    return run_llm(payload["gateway_url"], auth[7:], payload["prompt"], payload["target"])
+    wat = BedrockAgentCoreContext.get_workload_access_token()
+    if not wat:
+        return {"error": "no workload access token. Call the runtime with a user's JWT."}
+    token = exchange(wat)
+    return {"exchanged": claims(token), **run_llm(payload["gateway_url"], token, payload["prompt"], payload["target"])}
 
 
 if __name__ == "__main__":

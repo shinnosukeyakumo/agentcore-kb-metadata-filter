@@ -1,8 +1,9 @@
 """作ったリソースをすべて消す。
 
 .state.json が無くても消せるように、名前の頭（kbmf）で探す。
-消す順番: Runtime → Gateway（ターゲット → 本体）→ Policy（ポリシー → engine）→ KB（データソース → 本体）
-          → S3 → Lambda → Cognito → IAM ロール → CloudWatch Logs
+消す順番: Runtime → credential provider → Gateway（ターゲット → 本体）→ Policy（ポリシー → engine）
+          → KB（データソース → 本体）→ S3（バケットポリシー → 中身 → 本体）→ Lambda
+          → Cognito（ドメイン → ユーザープール）→ IAM ロール → CloudWatch Logs
 """
 
 import time
@@ -32,6 +33,13 @@ def runtimes() -> None:
             ok = gone(lambda: any(x["agentRuntimeId"] == rid
                                   for x in ctl.list_agent_runtimes(maxResults=100).get("agentRuntimes", [])))
             print("deleted runtime", r["agentRuntimeName"], ok)
+
+
+def credential_providers() -> None:
+    for p in ctl.list_oauth2_credential_providers(maxResults=20).get("credentialProviders", []):
+        if p["name"].startswith(f"{PREFIX}-"):
+            ctl.delete_oauth2_credential_provider(name=p["name"])
+            print("deleted credential provider", p["name"])
 
 
 def gateways() -> None:
@@ -79,6 +87,7 @@ def buckets() -> None:
     for name in (f"{PREFIX}-docs-{ACCOUNT}", f"{PREFIX}-code-{ACCOUNT}"):
         b = s3.Bucket(name)
         try:
+            b.Policy().delete()  # meta/ と acl/ の Deny を外してから中身を消す
             b.object_versions.delete()
             b.objects.all().delete()
             b.delete()
@@ -100,12 +109,17 @@ def user_pools() -> None:
     for page in idp.get_paginator("list_user_pools").paginate(MaxResults=60):
         for p in page["UserPools"]:
             if p["Name"] == f"{PREFIX}-pool":
+                domain = idp.describe_user_pool(UserPoolId=p["Id"])["UserPool"].get("Domain")
+                if domain:  # ドメインが残っているとユーザープールを消せない
+                    idp.delete_user_pool_domain(Domain=domain, UserPoolId=p["Id"])
+                    print("deleted user pool domain", domain)
                 idp.delete_user_pool(UserPoolId=p["Id"])
                 print("deleted user pool", p["Name"])
 
 
 def roles() -> None:
-    for name in (f"{PREFIX}-kb-role", f"{PREFIX}-gateway-role", f"{PREFIX}-runtime-role", f"{PREFIX}-lambda-role"):
+    for name in (f"{PREFIX}-kb-role", f"{PREFIX}-gateway-role", f"{PREFIX}-runtime-role", f"{PREFIX}-lambda-role",
+                 f"{PREFIX}-doc-writer", f"{PREFIX}-meta-admin"):
         try:
             for p in iam.list_role_policies(RoleName=name)["PolicyNames"]:
                 iam.delete_role_policy(RoleName=name, PolicyName=p)
@@ -129,7 +143,7 @@ def main() -> None:
     # Gateway や Knowledge Base は、削除のときにも実行ロールを使う。
     # 先にロールや S3 を消すと削除が FAILED で止まるので、前半が失敗したら後半には進まない
     failed = False
-    for step in (runtimes, gateways, policies, knowledge_bases):
+    for step in (runtimes, credential_providers, gateways, policies, knowledge_bases):
         try:
             step()
         except Exception as e:

@@ -9,13 +9,24 @@ LLM にツールとして Retrieve を渡すと、LLM が filter や userContext
 | REQUEST interceptor（Lambda） | LLM が書いた userContext と filter を、Cognito のトークンのクレームで入れ直す | `lambdas/interceptor.py`、`scripts/03_gateway.py` |
 | AgentCore Policy（Cedar） | userContext.userId がトークンの email と一致しない呼び出しを拒否する | `scripts/04_policy.py` |
 
+> 現在の構成（トークン交換、2 つの Gateway への Policy、メタデータを守るバケットポリシー）は、まだ通しで実行していません。実行して結果を確かめたら、この注記を外します。
+
 ## 構成
 
 ![構成図](docs/architecture.png)
 
-- ユーザーのアクセストークンは、Runtime からエージェント、エージェントから Gateway へそのまま渡します（トークン交換はしません）。Runtime と Gateway はどちらも `customJWTAuthorizer.allowedClients` で Cognito の同じクライアントを受け付けます
-- Cognito の Pre Token Generation（V3）で、アクセストークンに `email` と `department` を入れます（`lambdas/pretoken.py`）
-- Gateway のターゲットは `bedrock-knowledge-bases` コネクタの Retrieve です。LLM に見せる引数の違いで 3 つ用意します
+- ユーザーは Cognito の `web` クライアントでサインインし、そのトークンで Runtime を呼びます。エージェントは AgentCore Identity の On-Behalf-Of で、Gateway 用のトークン（`aud` が `kbmf-gateway`）に交換してから Gateway を呼びます。中では Cognito の token exchange が呼ばれ、`agent` クライアントの M2M トークンが actor として付きます
+- Gateway は `customJWTAuthorizer.allowedAudience` で `kbmf-gateway` だけを受け付けます。サインインしただけのトークンは通りません
+- Cognito の Pre Token Generation（V3）で、アクセストークンに `email` と `department` を入れます（`lambdas/pretoken.py`）。token exchange のときも呼ばれるので、交換後のトークンにも同じクレームが入ります
+
+Gateway は 2 つ作ります。どちらにも同じ Policy engine（`kbmf_pe`）を ENFORCE で付けます。Cedar は interceptor の後で評価されます。
+
+| Gateway | interceptor | ターゲット |
+|---|---|---|
+| `kbmf-gw` | あり | `locked`、`open`、`static` |
+| `kbmf-gw-policy` | なし | `kb`（userContext も filter も LLM が書ける） |
+
+`kbmf-gw` のターゲットは、どれも `bedrock-knowledge-bases` コネクタの Retrieve です。LLM に見せる引数の違いで 3 つ用意します。
 
 | ターゲット | LLM に見える filter | interceptor の扱い |
 |---|---|---|
@@ -36,11 +47,20 @@ LLM にツールとして Retrieve を渡すと、LLM が filter や userContext
 
 ユーザーは 2 人です。`user-a@example.com` が人事部（hr）、`user-b@example.com` が営業部（sales）です。
 
+S3 では、文書本体を `docs/`、メタデータを `meta/`、ACL を `acl/` に分けて置きます。データソースの `metadataFilesPrefix` を `meta/` にしています。バケットポリシーで、`meta/` と `acl/` には管理者のロールしか書けないようにします。
+
+| ロール | `docs/` | `meta/`、`acl/` |
+|---|---|---|
+| `kbmf-doc-writer`（文書の担当） | 書ける | バケットポリシーの Deny で書けない |
+| `kbmf-meta-admin`（メタデータの管理者） | 書ける | 書ける |
+
+`02_knowledge_base.py` を実行した人も、アップロードのために Deny から外しています。
+
 ## 前提
 
 - 東京リージョン（`ap-northeast-1`）で動かします。`AWS_REGION` で変えられますが、Managed Knowledge Base と AgentCore Policy が使えるリージョンに限ります
 - Bedrock で Claude Sonnet 4.6 を `jp.` の推論プロファイル（`jp.anthropic.claude-sonnet-4-6`）から呼べること
-- AWS の認証情報（IAM ロール、Cognito、Lambda、S3、Bedrock、AgentCore を作れる権限）
+- AWS の認証情報（IAM ロール、Cognito、Lambda、S3、Bedrock、AgentCore を作れる権限と、作ったロールを引き受ける `sts:AssumeRole`）
 - Python 3.12 以上と [uv](https://docs.astral.sh/uv/)（Runtime に載せる arm64 の依存を集めるのに使います）
 
 ```bash
@@ -51,20 +71,20 @@ export AWS_PROFILE=<使うプロファイル>
 
 ## 手順
 
-`scripts/` に移って、番号順に実行します。作ったリソースの ID とユーザーのパスワードは `.state.json` に保存されます（`.gitignore` 済み）。トークンは画面にもファイルにも出しません。
+`scripts/` に移って、番号順に実行します。作ったリソースの ID、ユーザーのパスワード、`agent` クライアントの secret は `.state.json` に保存されます（`.gitignore` 済み）。トークンは画面にもファイルにも出しません。
 
 ```bash
 cd scripts
 
 # 作る
-python 01_cognito.py        # ユーザープール、web クライアント、ユーザー 2 人、Pre Token Generation
-python 02_knowledge_base.py # S3 に文書とメタデータ、Managed Knowledge Base、取り込み
-python 03_gateway.py        # interceptor の Lambda、Gateway kbmf-gw、ターゲット 3 つ
-python 04_policy.py         # Policy engine、ポリシー 2 本、Gateway kbmf-gw-policy
-python 05_runtime.py        # エージェントを zip にして AgentCore Runtime に置く
+python 01_cognito.py        # ユーザープール、ドメイン、resource server、web と agent のクライアント、ユーザー 2 人、Pre Token Generation
+python 02_knowledge_base.py # S3 に文書とメタデータ、ロール 2 つとバケットポリシー、Managed Knowledge Base、取り込み
+python 03_gateway.py        # interceptor の Lambda、Policy engine、Gateway kbmf-gw、ターゲット 3 つ
+python 04_policy.py         # Gateway kbmf-gw-policy、2 つの Gateway のポリシー
+python 05_runtime.py        # credential provider kbmf-obo、エージェントを zip にして AgentCore Runtime に置く
 
 # 確かめる（結果は results/ に JSON で残ります）
-python 10_test_kb_direct.py # Gateway を通さず、KB を直接 Retrieve
+python 10_test_kb_direct.py # Gateway を通さず、KB を直接 Retrieve。S3 への書き込みも確かめる
 python 11_test_gateway.py   # Gateway 経由。ツール引数は自分で書いて送る
 python 12_test_llm.py       # Runtime 上の LLM に Gateway のツールを渡して頼む
 python 13_test_policy.py    # Cedar で userContext の偽装が止まるか
@@ -72,6 +92,10 @@ python 13_test_policy.py    # Cedar で userContext の偽装が止まるか
 # 消す
 python 99_cleanup.py
 ```
+
+`01_cognito.py` は最後に、サインインしたトークンと交換後のトークンのクレーム（`aud`、`email`、`department`、`act`）を表示します。交換後のほうに `aud: kbmf-gateway` と `act` が入っていれば、交換は動いています。
+
+`03_gateway.py` を実行してから `04_policy.py` を実行するまでのあいだは、`kbmf-gw` へのすべての呼び出しが Cedar に拒否されます。ポリシーが 1 本も無いと、Cedar は既定で拒否するためです。
 
 各スクリプトは何度実行しても同じ名前のリソースを使い回します。途中で失敗したら、原因を直してそのスクリプトから実行し直してください。
 
@@ -82,7 +106,8 @@ python 99_cleanup.py
 | `10_test_kb_direct.py` | M1 | userContext なし / user-a / user-b で、出てくる文書が ACL どおりに変わるか |
 | | M2 | 平らな書式と型付きの書式のどちらでも filter が効くか |
 | | M3 | filter と ACL が重なって効くか。未対応の演算子（`startsWith`）でどうなるか |
-| `11_test_gateway.py` | G0 | 3 つのターゲットで、LLM に見える inputSchema |
+| | M4 | 文書担当と管理者のロールで、`docs/`、`meta/`、`acl/` に書けるか |
+| `11_test_gateway.py` | G0 | サインインしただけのトークンが 403 になるか。3 つのターゲットで、LLM に見える inputSchema |
 | | G1 | `locked` で、何も書かなくてもトークンの department で絞られるか |
 | | G2 | `locked` に department=hr の filter や他人の userContext を書いて送ったらどうなるか |
 | | G3 | `open` で、user-b が書いた filter と department の条件が重なるか |
@@ -91,9 +116,12 @@ python 99_cleanup.py
 | | G6 | interceptor のログで、受け取った引数と送った引数を見比べる |
 | `12_test_llm.py` | L1 | `open` を渡された LLM が filter をどう書くか |
 | | L2 | 同じ頼みを `locked` で。LLM が何を書いても department=sales に置き換わるか |
-| `13_test_policy.py` | P1 | user-b のトークンで userContext に user-a を書く |
-| | P2 | userContext を書かない |
-| | P3 | userContext に自分（user-b）を書く |
+| `13_test_policy.py` | P1 | interceptor なしの Gateway で、user-b のトークンで userContext に user-a を書く |
+| | P2 | 同じく、userContext を書かない |
+| | P3 | 同じく、userContext に自分（user-b）を書く |
+| | P4 | interceptor ありの Gateway（`locked`）で、P1 と同じ偽装をする |
+
+P1 と P2 は Cedar に拒否され、P3 は通る想定です。P4 は、interceptor が userContext を user-b に書き換えてから Cedar が評価するので通り、user-b が読める文書だけが返る想定です。
 
 LLM の出力は毎回変わります。L1 で LLM が filter を書くかどうか、何を書くかは実行ごとに違ってかまいません。interceptor のログに残る `received` と `sent` を見れば、LLM が書いた値と Gateway が KB に送った値の違いが分かります。
 
@@ -101,39 +129,35 @@ LLM の出力は毎回変わります。L1 で LLM が filter を書くかどう
 
 ## 実装で気をつけたこと
 
+- AgentCore Identity は token exchange の `subject_token_type` に `jwt` を付けて送りますが、Cognito は `access_token` しか受け付けません。エージェントは `customParameters` で `urn:ietf:params:oauth:token-type:access_token` に上書きしています（`agent/main.py`）
+- Runtime の実行ロールには、トークン交換のために `bedrock-agentcore:GetResourceOauth2Token`（token vault の ARN）と、credential provider の secret を読む `secretsmanager:GetSecretValue`（`bedrock-agentcore-identity!*`）が必要です
 - interceptor が書き換える引数は `visible: true` のままにしています。`visible: false` にした引数は、interceptor が書いても `cannot set parameter(s)` で弾かれます。そのため、見えている引数を毎回必ず上書きする作りにしています
 - `department` クレームが無いトークンでは、filter をどの文書にも一致しない値（`__no_department__`）にします。`email` が無いときの userContext も同様です
 - Policy engine を付けた Gateway の実行ロールには `bedrock-agentcore:GetPolicyEngine`、`AuthorizeAction`、`PartiallyAuthorizeActions` が必要です
 - ポリシーは `validationMode="IGNORE_ALL_FINDINGS"` で作ります。既定の検証だと、スキーマに無い `context.input` を参照する式で permit まで弾かれます
+- Cedar の permit はターゲットごとに必要です。permit の無いターゲットは、`tools/list` にも出てきません
 - Policy engine、ポリシー、Runtime の名前にはハイフンを使えないので `_` にしています
 
 ## 費用と後片付け
 
-課金されるのは主に、Managed Knowledge Base（取り込みと検索）、Gateway の呼び出し、Runtime の実行時間、Claude Sonnet 4.6 の呼び出し、Lambda、S3、CloudWatch Logs です。テストで送るリクエストは数十回程度ですが、Knowledge Base などは置いておくだけで費用がかかるものもあるので、確かめ終わったらすぐに `99_cleanup.py` を実行してください。料金は各サービスの料金ページで確認してください。
+課金されるのは主に、Managed Knowledge Base（取り込みと検索）、Gateway の呼び出し、Policy の評価、Runtime の実行時間、Claude Sonnet 4.6 の呼び出し、Lambda、S3、CloudWatch Logs、Cognito（Essentials プランと M2M のトークン発行）です。テストで送るリクエストは数十回程度ですが、Knowledge Base などは置いておくだけで費用がかかるものもあるので、確かめ終わったらすぐに `99_cleanup.py` を実行してください。料金は各サービスの料金ページで確認してください。
 
 `99_cleanup.py` は `.state.json` が無くても動くように、名前の頭（`kbmf`）でリソースを探して消します。
 
 | 種類 | 名前 |
 |---|---|
 | AgentCore Runtime | `kbmf_agent` |
+| AgentCore Identity の credential provider | `kbmf-obo` |
 | AgentCore Gateway | `kbmf-gw`、`kbmf-gw-policy`（ターゲットごと） |
 | Policy engine | `kbmf_pe`（ポリシーごと） |
 | Knowledge Base | `kbmf-kb`（データソースごと） |
-| S3 バケット | `kbmf-docs-<アカウント ID>`、`kbmf-code-<アカウント ID>` |
+| S3 バケット | `kbmf-docs-<アカウント ID>`（バケットポリシーごと）、`kbmf-code-<アカウント ID>` |
 | Lambda | `kbmf-pretoken`、`kbmf-interceptor` |
-| Cognito ユーザープール | `kbmf-pool` |
-| IAM ロール | `kbmf-kb-role`、`kbmf-gateway-role`、`kbmf-runtime-role`、`kbmf-lambda-role` |
+| Cognito | ドメイン `kbmf-tx-<アカウント ID の下 6 桁>`、ユーザープール `kbmf-pool` |
+| IAM ロール | `kbmf-kb-role`、`kbmf-gateway-role`、`kbmf-runtime-role`、`kbmf-lambda-role`、`kbmf-doc-writer`、`kbmf-meta-admin` |
 | CloudWatch Logs | `/aws/lambda/kbmf-*`、`/aws/bedrock-agentcore/runtimes/kbmf_*` |
 
-Runtime、Gateway、Policy engine、Knowledge Base の削除に失敗したときは、そこで止まります。Gateway と Knowledge Base は削除のときにも実行ロールを使うので、先にロールを消すと削除できなくなるためです。失敗が表示されたら、少し待ってからもう一度実行してください。
-
-## 記事との違い
-
-このリポジトリは、Qiita の記事を書くために行った検証を、第三者が動かせる形に整理し直したものです。整理の都合で、記事の元になった検証とは次の点が違います。
-
-- 元の検証では、Runtime で受けたトークンを Gateway 用のトークンに交換（On-Behalf-Of）し、`allowedAudience` で検証していました。ここでは同じ Cognito クライアントのトークンをそのまま渡し、`allowedClients` で検証します。interceptor が読むクレーム（`email`、`department`）は同じです
-- 記事にある「interceptor と Policy を組み合わせた構成」は含めていません。Policy は interceptor を付けない Gateway だけで確かめます
-- ACL を持たない文書は入れていません
+Runtime、credential provider、Gateway、Policy engine、Knowledge Base の削除に失敗したときは、そこで止まります。Gateway と Knowledge Base は削除のときにも実行ロールを使うので、先にロールを消すと削除できなくなるためです。失敗が表示されたら、少し待ってからもう一度実行してください。
 
 ## ライセンス
 

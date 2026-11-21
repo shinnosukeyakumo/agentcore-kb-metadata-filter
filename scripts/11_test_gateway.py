@@ -1,6 +1,9 @@
 """Gateway（kbmf-gw）経由で Retrieve を呼ぶ。LLM は使わず、ツール引数を自分で書いて送る。
 
-G0 tools/list       : 3 つのターゲットで、LLM に見える inputSchema
+Gateway に渡すトークンは、エージェントと同じく Cognito の token exchange で取る（aud = kbmf-gateway）。
+kbmf-gw には interceptor と Policy の両方が付いている。
+
+G0 tools/list       : 3 つのターゲットで、LLM に見える inputSchema。サインインしただけのトークンは 403 になるか
 G1 locked           : 何も書かなくても、トークンの department で絞られるか
 G2 locked に偽装     : user-b が department=hr の filter や、user-a の userContext を書いて送る
 G3 open             : user-b が filter を書く（department=hr / year=2026 / なし）
@@ -16,8 +19,8 @@ import time
 
 import boto3
 
-from common import (GATEWAY_DONE, REGION, USER_A, USER_B, claims, ctl, load_state, mcp, save_result, sign_in,
-                    wait_status)
+from common import (GATEWAY_DONE, REGION, USER_A, USER_B, claims, ctl, gateway_token, load_state, mcp, save_result,
+                    sign_in, wait_status)
 
 gwsetup = importlib.import_module("03_gateway")
 logs = boto3.client("logs", region_name=REGION)
@@ -60,9 +63,11 @@ def main() -> None:
     state = load_state()
     gw, kid, url = state["gateway"], state["kb"]["kb_id"], state["gateway"]["url"]
     start = int(time.time() * 1000)
-    ta, tb = sign_in(state, USER_A), sign_in(state, USER_B)
-    out = {"claims": {u: {k: claims(t).get(k) for k in ("client_id", "email", "department")}
+    ta, tb = gateway_token(state, USER_A), gateway_token(state, USER_B)
+    out = {"claims": {u: {k: claims(t).get(k) for k in ("client_id", "aud", "email", "department", "act")}
                       for u, t in (("user-a", ta), ("user-b", tb))}}
+    status, j = mcp(url, sign_in(state, USER_A), "tools/list")
+    out["G0_sign_in_token"] = {"http": status, "body": j}
     _, j = mcp(url, ta, "tools/list")
     out["G0_tools_list"] = {t["name"]: t.get("inputSchema") for t in (j.get("result") or {}).get("tools", [])}
     out["G1_locked"] = {f"{u}_{q}": call(url, t, "locked", q) for u, t in (("user-a", ta), ("user-b", tb)) for q in Q}

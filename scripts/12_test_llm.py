@@ -1,5 +1,8 @@
 """Runtime 上のエージェント（LLM）に Gateway のツールを渡して、user-b として頼みごとをする。
 
+Runtime はサインインしたユーザーのトークンで呼ぶ。エージェントが中で On-Behalf-Of の交換をして Gateway に渡す。
+交換後のトークンのクレーム（aud、email、department、act）を最初の結果で表示する。
+
 L1 open   : LLM が filter をどう書くか。user-b（sales）なのに department=hr を書くことがある
 L2 locked : 同じ頼みでも、interceptor が department=sales に置き換える
 LLM の出力は毎回変わるので、filter を書くかどうかは実行ごとに違ってよい。
@@ -46,6 +49,8 @@ def main() -> None:
             r = invoke(arn, tb, {"gateway_url": url, "target": target, "prompt": prompt})
             out[f"{target}_{i}"] = {"prompt": prompt, **r}
             calls = r.get("tool_calls", [])
+            if target == "open" and i == 1:
+                print("exchanged:", json.dumps(r.get("exchanged"), ensure_ascii=False))
             print(target, i, prompt)
             for c in calls:
                 f = (c.get("input") or {}).get("retrievalConfiguration", {}).get("managedSearchConfiguration", {})

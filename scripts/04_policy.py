@@ -1,11 +1,14 @@
-"""AgentCore Policy（Cedar）で userContext の偽装を止める構成を用意する。
+"""AgentCore Policy（Cedar）のポリシーを入れ、interceptor を使わない Gateway（kbmf-gw-policy）を用意する。
 
-interceptor を使わない別の Gateway（kbmf-gw-policy）を作り、Policy engine を ENFORCE で付ける。
-ターゲット kb は userContext も filter も LLM に見せる（書き換える仕組みが無いので、Cedar で検査する）。
+Policy engine（kbmf_pe）は 03_gateway.py で作り、kbmf-gw に ENFORCE で付けてある。
+ここでは同じ engine を kbmf-gw-policy にも付け、2 つの Gateway の全ターゲットにポリシーを入れる。
 
-ポリシーは 2 本。
-- permit_retrieve : Retrieve を許可する（Cedar は既定で拒否なので、permit が 1 本は必要）
-- forbid_mismatch : userContext.userId がトークンの email と一致しなければ拒否する
+ターゲットごとに 2 本。
+- permit_<gw>_<target> : Retrieve を許可する（Cedar は既定で拒否なので、permit が 1 本は必要）
+- forbid_<gw>_<target> : userContext.userId がトークンの email と一致しなければ拒否する
+
+kbmf-gw では interceptor が userContext を email で上書きしてから Cedar が評価されるので、forbid には当たらない。
+kbmf-gw-policy のターゲット kb は userContext も filter も LLM に見せる（書き換える仕組みが無いので、Cedar で検査する）。
 """
 
 import importlib
@@ -16,39 +19,24 @@ from common import GATEWAY_DONE, PREFIX, ctl, load_state, save_state, wait_statu
 gwsetup = importlib.import_module("03_gateway")
 
 GW_NAME = f"{PREFIX}-gw-policy"
-PE_NAME = f"{PREFIX}_pe"  # Policy engine とポリシーの名前にハイフンは使えない
 TARGET = "kb"
 
 
-def ensure_engine() -> dict:
-    pe = next((p for p in ctl.list_policy_engines().get("policyEngines", []) if p["name"] == PE_NAME), None)
-    if not pe:
-        pe = ctl.create_policy_engine(name=PE_NAME, description="kbmf: check userContext against the token")
-        print(f"created policy engine {PE_NAME}")
-    for _ in range(60):
-        pe = ctl.get_policy_engine(policyEngineId=pe["policyEngineId"])
-        if pe["status"] in ("ACTIVE", "CREATE_FAILED"):
-            break
-        time.sleep(3)
-    print("policy engine", pe["status"])
-    return pe
-
-
-def statements(gw_arn: str) -> dict:
-    head = f'action == AgentCore::Action::"{TARGET}___Retrieve", resource == AgentCore::Gateway::"{gw_arn}"'
+def statements(prefix: str, target: str, gw_arn: str) -> dict:
+    head = f'action == AgentCore::Action::"{target}___Retrieve", resource == AgentCore::Gateway::"{gw_arn}"'
     return {
-        "permit_retrieve": f"permit (principal, {head});",
-        "forbid_mismatch": (
+        f"permit_{prefix}_{target}": f"permit (principal, {head});",
+        f"forbid_{prefix}_{target}": (
             f'forbid (principal, {head}) unless {{ principal.hasTag("email") && '
             f'context.input has userContext && context.input.userContext has userId && '
             f'context.input.userContext.userId == principal.getTag("email") }};'),
     }
 
 
-def ensure_policies(pe_id: str, gw_arn: str) -> dict:
+def ensure_policies(pe_id: str, stmts: dict) -> dict:
     existing = {p["name"]: p for p in ctl.list_policies(policyEngineId=pe_id).get("policies", [])}
     out = {}
-    for name, stmt in statements(gw_arn).items():
+    for name, stmt in stmts.items():
         p = existing.get(name) or ctl.create_policy(
             policyEngineId=pe_id, name=name, definition={"cedar": {"statement": stmt}},
             # 既定の検証だと、スキーマに無い context.input の参照で permit まで弾かれる
@@ -66,7 +54,7 @@ def ensure_policies(pe_id: str, gw_arn: str) -> dict:
 def main() -> None:
     state = load_state()
     kid = state["kb"]["kb_id"]
-    pe = ensure_engine()
+    pe = gwsetup.ensure_engine()
     gw = next((g for g in ctl.list_gateways()["items"] if g["name"] == GW_NAME), None)
     if not gw:
         gw = ctl.create_gateway(
@@ -86,7 +74,11 @@ def main() -> None:
                 {"path": gwsetup.FILTER, "visible": True,
                  "description": "Metadata filter. Keys: department (hr, sales), year (number)."}]}
     target = gwsetup.ensure_target(gid, TARGET, gwsetup.target_config(spec))
-    policies = ensure_policies(pe["policyEngineId"], g["gatewayArn"])
+
+    stmts = statements("policy", TARGET, g["gatewayArn"])
+    for name in state["gateway"]["targets"]:
+        stmts.update(statements("gw", name, state["gateway"]["arn"]))
+    policies = ensure_policies(pe["policyEngineId"], stmts)
     state["policy"] = {"gateway_id": gid, "url": g["gatewayUrl"], "engine_id": pe["policyEngineId"],
                        "target": target, "policies": policies}
     save_state(state)
